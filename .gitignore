@@ -1,0 +1,13 @@
+node_modules/
+.next/
+out/
+*.tsbuildinfo
+.env*
+!.env.example
+!.env.local.example
+backend/.venv/
+backend/__pycache__/
+backend/data/
+backend/uploads/
+*.db
+*.sqlite3
