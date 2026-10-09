@@ -112,3 +112,4 @@ All health-data routes require the bearer token returned by signup or login.
 ## Deployment notes
 
 The Vercel and Render services must be deployed from your own accounts. Do not commit production secrets or real patient data. Set `LLM_API_KEY` only as a Render secret for live AI responses; without it, the copilot uses its explicit demo response.
+# WeCareAI-copilot
