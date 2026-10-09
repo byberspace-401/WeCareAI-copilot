@@ -9,6 +9,9 @@ import os
 import re
 import secrets
 import sqlite3
+import tempfile
+import threading
+import time
 import uuid
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
@@ -17,7 +20,7 @@ from typing import Any, Iterator
 
 import httpx
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, File, Header, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Header, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -31,6 +34,11 @@ DB_PATH = Path(os.getenv("SQLITE_PATH", DATA_DIR / "carecopilot.db"))
 DATABASE_URL = os.getenv("DATABASE_URL") or os.getenv("SUPABASE_DB_URL")
 MAX_UPLOAD_BYTES = 10 * 1024 * 1024
 ALLOWED_EXTENSIONS = {".pdf", ".jpg", ".jpeg", ".png"}
+DEMO_ONLY = os.getenv("DEMO_ONLY", "").strip().lower() == "true"
+DEMO_RATE_LIMITS = {"chat": 20, "report": 5}
+DEMO_RATE_WINDOW_SECONDS = 60 * 60
+_demo_requests: dict[tuple[str, str], list[float]] = {}
+_demo_requests_lock = threading.Lock()
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -184,7 +192,7 @@ def initialize_database() -> None:
 
 @app.on_event("startup")
 def startup() -> None:
-    if os.getenv("RENDER") == "true":
+    if os.getenv("RENDER") == "true" and not DEMO_ONLY:
         required = {
             "SUPABASE_DB_URL": DATABASE_URL,
             "SUPABASE_URL": os.getenv("SUPABASE_URL"),
@@ -492,6 +500,46 @@ async def copilot_chat(request: ChatRequest, user_id: str = Depends(signed_in_us
     return {"response": response, "emergency": emergency, "mode": mode}
 
 
+def enforce_demo_rate_limit(request: Request, operation: str) -> None:
+    if operation not in DEMO_RATE_LIMITS:
+        raise ValueError("Unknown demo operation.")
+    client_key = request.client.host if request.client else "unknown"
+    now = time.monotonic()
+    cutoff = now - DEMO_RATE_WINDOW_SECONDS
+    key = (operation, client_key)
+    with _demo_requests_lock:
+        timestamps = [stamp for stamp in _demo_requests.get(key, []) if stamp > cutoff]
+        if len(timestamps) >= DEMO_RATE_LIMITS[operation]:
+            raise HTTPException(
+                status_code=429,
+                detail="Demo usage limit reached. Please try again later or sign in to your account.",
+            )
+        timestamps.append(now)
+        _demo_requests[key] = timestamps
+
+
+@app.post("/api/demo/chat")
+async def demo_chat(request: ChatRequest, client_request: Request) -> dict[str, Any]:
+    enforce_demo_rate_limit(client_request, "chat")
+    message = request.message.strip()
+    if not message:
+        raise HTTPException(status_code=422, detail="Enter a question to continue.")
+    if emergency_detected(message):
+        response = (
+            "POTENTIAL EMERGENCY DETECTED\n\n"
+            "Your symptoms may require urgent medical attention. Please contact your local "
+            "emergency number or seek immediate in-person care now. Do not wait for an online "
+            "response. CareCopilot has not called anyone or shared your location."
+        )
+        return {"response": response, "emergency": True, "mode": "safety"}
+    context = {"profile": None, "symptoms": [], "records": [], "medications": [], "reports": []}
+    return {
+        "response": await get_ai_response(message, context),
+        "emergency": False,
+        "mode": "ai" if os.getenv("LLM_API_KEY") else "demo",
+    }
+
+
 def extract_report_text(path: Path, extension: str) -> tuple[str, str]:
     if extension == ".pdf":
         try:
@@ -605,6 +653,41 @@ async def report_summary(extracted_text: str) -> str:
             return summary
     except (httpx.HTTPError, KeyError, IndexError, ValueError) as exc:
         raise HTTPException(status_code=502, detail="The AI service could not summarize this report.") from exc
+
+
+@app.post("/api/demo/reports/upload")
+async def demo_upload_report(request: Request, file: UploadFile = File(...)) -> dict[str, Any]:
+    enforce_demo_rate_limit(request, "report")
+    if not os.getenv("LLM_API_KEY"):
+        raise HTTPException(status_code=503, detail="AI is not configured for demo use yet.")
+    original_name = Path(file.filename or "report").name
+    extension = Path(original_name).suffix.lower()
+    if extension not in ALLOWED_EXTENSIONS:
+        raise HTTPException(status_code=415, detail="Upload a PDF, JPG, JPEG, or PNG report.")
+    try:
+        with tempfile.TemporaryDirectory(prefix="demo-report-", dir=DATA_DIR) as temp_dir:
+            destination = Path(temp_dir) / f"report{extension}"
+            size = 0
+            with destination.open("wb") as output:
+                while chunk := await file.read(1024 * 1024):
+                    size += len(chunk)
+                    if size > MAX_UPLOAD_BYTES:
+                        raise HTTPException(status_code=413, detail="Report must be 10 MB or smaller.")
+                    output.write(chunk)
+            if extension == ".pdf":
+                extracted_text, report_type = extract_report_text(destination, extension)
+            else:
+                extracted_text, report_type = await extract_image_report_text(destination, extension)
+            summary = await report_summary(extracted_text)
+    finally:
+        await file.close()
+    return {
+        "id": str(uuid.uuid4()),
+        "file_name": original_name,
+        "report_type": report_type,
+        "ai_summary": summary,
+        "created_at": now_iso(),
+    }
 
 
 @app.post("/api/reports/upload")

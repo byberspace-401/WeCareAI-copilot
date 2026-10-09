@@ -62,18 +62,21 @@ Set `LLM_API_KEY`, `LLM_BASE_URL`, and `LLM_MODEL` in the backend environment. T
 
 Report text extraction supports PDFs with selectable text when `pypdf` is installed. Scanned/image-only PDFs are not OCR'd; upload a JPG or PNG scan when image text extraction is needed. Medical report text and uploaded report images are sent to the configured AI provider for explanation/scanning, so configure a provider you trust and use synthetic data for demos.
 
-## Deploy an HTTPS demo (Vercel + Render + Supabase)
+## Deploy the frontend and API
 
-The repository includes a Render Blueprint in `render.yaml`. For persistent hosted storage:
+The `render.yaml` Blueprint deploys the FastAPI backend as `carecopilot-api`; it does not automatically connect the frontend. The frontend and API are separate services, and signup fails if the browser is pointed at the frontend hostname or at `localhost`.
 
-1. Create a fresh Supabase project. In its SQL Editor, run [`schema.sql`](./supabase/schema.sql). The API owns account signup, password hashing, sessions, and user-data authorization. It connects to Supabase PostgreSQL only from the backend. Row-level security is enabled; the server-side service-role key must never be placed in the browser.
-2. Create a Render web service from this repository and select its Blueprint. Set `SUPABASE_DB_URL` to the Supabase PostgreSQL connection URI (use the Supabase pooler URI if required by the host/network), `SUPABASE_URL` to the project URL, `SUPABASE_SERVICE_ROLE_KEY` to its server-only service-role key, and `CORS_ORIGINS` to the exact Vercel origin, e.g. `https://your-project.vercel.app` (no trailing slash). Keep all secrets in Render environment variables.
-3. Deploy the frontend on Vercel from this repository and set `NEXT_PUBLIC_API_URL` to the Render service URL, e.g. `https://carecopilot-api.onrender.com` (no trailing slash). Redeploy after setting this variable.
-4. Open the Vercel HTTPS URL on Android. HTTPS allows the browser to request location permission after the user activates SOS.
+1. Create a Supabase project and run [`schema.sql`](./supabase/schema.sql) in its SQL Editor.
+2. In Render, create/deploy the backend web service using this repository's Blueprint. Set `SUPABASE_DB_URL`, `SUPABASE_URL`, and `SUPABASE_SERVICE_ROLE_KEY` on the backend service. Set `CORS_ORIGINS` to the exact frontend origin, e.g. `https://wecareai-copilot.onrender.com` (no trailing slash). Keep secrets on the backend only.
+3. Confirm the backend service is deployed by opening `https://<your-api-service>.onrender.com/api/health`; it should return JSON with `"status":"ok"`. A 404 means the backend is not deployed at that URL.
+4. In the Render dashboard, open the frontend service (`wecareai-copilot`) and add `NEXT_PUBLIC_API_URL` with the backend's public base URL, e.g. `https://carecopilot-api.onrender.com` (no trailing slash). Save and redeploy the frontend so Next.js includes this public variable in its browser bundle. For a Vercel frontend, set the same variable in Vercel and redeploy.
+5. Retry signup at the frontend URL. Do not set the frontend API URL to `localhost`; in a browser that means the visitor's own computer, not the Render backend.
 
-Render's free service may sleep when idle, so the first request can take a short while to wake. The private reports bucket uses the server-side service-role key for uploads and must never be made public. SQLite/local-file mode remains for local development; hosted deployment should have Supabase settings configured before accepting accounts or reports.
+Render's free service may sleep when idle, so the first request can take a short while to wake. The API owns account signup, password hashing, sessions, and user-data authorization; it connects to Supabase PostgreSQL only from the backend. The server-side service-role key must never be placed in the browser. Open the frontend's HTTPS URL on Android to allow browser location permission after the user activates SOS.
 
 Local signup and login create accounts, hash passwords, and scope health data to the signed-in account. Sessions expire after 30 days and are stored in browser local storage; email verification and password reset are not implemented. This hackathon prototype is not a production patient-record system or HIPAA-compliant service.
+
+The sign-in page also offers **Continue as demo** and the `admin` / `admin` demo login for previews without creating an account. Demo changes are local to the browser. Signup and normal login require the backend; if it cannot be reached, the page shows a connection error rather than treating the request as a successful demo sign-in.
 
 ## Main API routes
 

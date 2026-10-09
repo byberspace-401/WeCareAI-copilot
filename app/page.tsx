@@ -14,6 +14,8 @@ import { ChangeEvent, FormEvent, useEffect, useMemo, useState } from "react";
 import ReactMarkdown from "react-markdown";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
+const DEMO_SESSION_KEY = "carecopilot_demo_session";
+const DEMO_NAME_KEY = "carecopilot_demo_name";
 type Profile = { name: string; age: number; gender: string; blood_group: string; allergies: string[]; medical_history: string[] };
 type HealthRecord = { id: string; type: string; value: number; unit: string; recorded_at: string };
 type Symptom = { id: string; description: string; severity: number; started_at: string };
@@ -67,6 +69,7 @@ async function api<T>(path: string, init?: RequestInit): Promise<T> {
 
 export default function Home() {
   const [signedIn, setSignedIn] = useState(false);
+  const [isDemo, setIsDemo] = useState(false);
   const [authReady, setAuthReady] = useState(false);
   const [authMode, setAuthMode] = useState<"signup" | "login">("signup");
   const [authName, setAuthName] = useState("");
@@ -93,12 +96,22 @@ export default function Home() {
   const [emergencyMessage, setEmergencyMessage] = useState("");
 
   useEffect(() => {
-    setSignedIn(Boolean(window.localStorage.getItem("carecopilot_token")));
+    const demoSession = window.localStorage.getItem(DEMO_SESSION_KEY) === "true";
+    const savedDemoName = window.localStorage.getItem(DEMO_NAME_KEY);
+    if (demoSession && savedDemoName) {
+      setProfile((current) => ({ ...current, name: savedDemoName }));
+    }
+    setIsDemo(demoSession);
+    setSignedIn(demoSession || Boolean(window.localStorage.getItem("carecopilot_token")));
     setAuthReady(true);
   }, []);
 
   useEffect(() => {
     if (!signedIn) return;
+    if (isDemo) {
+      setBackendOnline(false);
+      return;
+    }
     api<{ profile: Profile; records: HealthRecord[]; symptoms: Symptom[]; medications: Medication[]; reports: Report[]; emergency_events: EmergencyEvent[] }>("/api/dashboard")
       .then((data) => {
         setBackendOnline(true);
@@ -116,11 +129,34 @@ export default function Home() {
         setAuthMode("login");
         setAuthError(error instanceof Error ? error.message : "Please sign in again.");
       });
-  }, [signedIn]);
+  }, [signedIn, isDemo]);
+
+  function enterDemo() {
+    const demoName = authName.trim() || authEmail.trim().split("@")[0] || "Demo User";
+    window.localStorage.removeItem("carecopilot_token");
+    window.localStorage.setItem(DEMO_SESSION_KEY, "true");
+    window.localStorage.setItem(DEMO_NAME_KEY, demoName);
+    setProfile({ name: demoName, age: 0, gender: "", blood_group: "", allergies: [], medical_history: [] });
+    setRecords([]);
+    setSymptoms([]);
+    setMedications([]);
+    setReports([]);
+    setEmergencyEvents([]);
+    setChat([]);
+    setIsDemo(true);
+    setBackendOnline(false);
+    setSignedIn(true);
+    setAuthPassword("");
+    setAuthError("");
+  }
 
   async function submitAuth(event: FormEvent) {
     event.preventDefault();
     setAuthError("");
+    if (authMode === "login" && authEmail.trim().toLowerCase() === "admin" && authPassword === "admin") {
+      enterDemo();
+      return;
+    }
     setAuthBusy(true);
     try {
       const response = await api<{ access_token: string }>(`/api/auth/${authMode}`, {
@@ -131,7 +167,11 @@ export default function Home() {
       setSignedIn(true);
       setAuthPassword("");
     } catch (error) {
-      setAuthError(error instanceof Error ? error.message : "We couldn’t complete that request. Please try again.");
+      if (error instanceof TypeError) {
+        setAuthError(`Cannot connect to the CareCopilot API at ${API_URL}. Start the backend locally, or set NEXT_PUBLIC_API_URL to your deployed backend URL and redeploy the frontend.`);
+      } else {
+        setAuthError(error instanceof Error ? error.message : "We couldn’t complete that request. Please try again.");
+      }
     } finally {
       setAuthBusy(false);
     }
@@ -139,10 +179,13 @@ export default function Home() {
 
   async function signOut() {
     try {
-      await api("/api/auth/logout", { method: "POST" });
+      if (!isDemo) await api("/api/auth/logout", { method: "POST" });
     } finally {
       window.localStorage.removeItem("carecopilot_token");
+      window.localStorage.removeItem(DEMO_SESSION_KEY);
+      window.localStorage.removeItem(DEMO_NAME_KEY);
       setSignedIn(false);
+      setIsDemo(false);
       setBackendOnline(false);
       setPage("overview");
       setChat([]);
@@ -165,6 +208,17 @@ export default function Home() {
     setQuestion("");
     setChat((items) => [...items, { role: "user", message: text }]);
     setBusy(true);
+    if (isDemo) {
+      try {
+        const answer = await api<{ response: string; emergency: boolean; mode: "ai" | "demo" | "safety" }>("/api/demo/chat", { method: "POST", body: JSON.stringify({ message: text }) });
+        setChat((items) => [...items, { role: "assistant", message: answer.response, emergency: answer.emergency, mode: answer.mode }]);
+      } catch (error) {
+        setChat((items) => [...items, { role: "assistant", message: error instanceof Error ? `Demo AI unavailable: ${error.message}` : "Demo AI is unavailable. Check the backend configuration and try again." }]);
+      } finally {
+        setBusy(false);
+      }
+      return;
+    }
     try {
       const answer = await api<{ response: string; emergency: boolean; mode: "ai" | "demo" | "safety" }>("/api/copilot/chat", { method: "POST", body: JSON.stringify({ message: text }) });
       setChat((items) => [...items, { role: "assistant", message: answer.response, emergency: answer.emergency, mode: answer.mode }]);
@@ -180,9 +234,9 @@ export default function Home() {
     form.append("file", file);
     setBusy(true);
     try {
-      const report = await api<Report>("/api/reports/upload", { method: "POST", body: form });
+      const report = await api<Report>(isDemo ? "/api/demo/reports/upload" : "/api/reports/upload", { method: "POST", body: form });
       setReports((items) => [report, ...items]);
-      setToast("Report analyzed and added to your records.");
+      setToast(isDemo ? "Report analyzed with AI for this demo. It was not saved." : "Report analyzed and added to your records.");
     } catch (error) {
       setToast(error instanceof Error ? error.message : "Could not upload report.");
     } finally {
@@ -199,6 +253,18 @@ export default function Home() {
     setEmergencyMessage("");
     navigator.geolocation.getCurrentPosition(async (position) => {
       const location = { latitude: position.coords.latitude, longitude: position.coords.longitude, trigger_type: "user_activated_sos" };
+      if (isDemo) {
+        setEmergencyEvents((events) => [{
+          id: `demo-${Date.now()}`,
+          ...location,
+          created_at: new Date().toISOString(),
+        }, ...events]);
+        setEmergency(location);
+        setEmergencyBusy(false);
+        setModal(null);
+        setToast("Demo only: this event was not saved and no services or contacts were notified.");
+        return;
+      }
       try {
         const result = await api<{ event: EmergencyEvent }>("/api/emergency/activate", { method: "POST", body: JSON.stringify(location) });
         setEmergencyEvents((events) => [result.event, ...events]);
@@ -236,6 +302,7 @@ export default function Home() {
       error={authError}
       busy={authBusy}
       onSubmit={submitAuth}
+      onDemo={enterDemo}
     />;
   }
 
@@ -282,6 +349,7 @@ export default function Home() {
               <button onClick={() => setModal("emergency")} className="flex items-center gap-2 rounded-xl bg-[#c95140] px-3.5 py-2.5 text-[11px] font-bold text-white shadow-sm hover:bg-[#b94736]"><Siren size={15} /><span className="hidden sm:inline">SOS</span></button>
             </div>
           </header>
+          {isDemo && <div role="status" className="border-b border-[#ead9a9] bg-[#fff8e7] px-5 py-2.5 text-center text-[10px] font-medium leading-5 text-[#765c24] md:px-9">Demo session: AI chat and report scanning use the connected server and AI provider. Uploaded content may be sent to the configured AI provider for processing; it is not saved to your account. Other demo changes stay in this browser.</div>}
           <div className="mx-auto max-w-[1320px] px-5 py-7 md:px-9 md:py-9">
             {emergency ? <EmergencyPanel location={emergency} onClose={() => setEmergency(null)} /> : (
               <>
@@ -299,6 +367,19 @@ export default function Home() {
         </section>
       </div>
       {modal && <Modal type={modal} onClose={() => setModal(null)} onEmergency={activateEmergency} emergencyBusy={emergencyBusy} emergencyMessage={emergencyMessage} onSaved={async (kind, value) => {
+        if (isDemo) {
+          const id = `demo-${Date.now()}`;
+          if (kind === "symptom") {
+            setSymptoms((items) => [{ id, description: String(value.description), severity: Number(value.severity), started_at: String(value.started_at) }, ...items]);
+          } else if (kind === "record") {
+            setRecords((items) => [{ id, type: String(value.type), value: Number(value.value), unit: String(value.unit), recorded_at: String(value.recorded_at) }, ...items]);
+          } else {
+            setMedications((items) => [{ id, name: String(value.name), dosage: String(value.dosage), frequency: String(value.frequency) }, ...items]);
+          }
+          setModal(null);
+          setToast("Demo only: this item was not saved to a backend.");
+          return;
+        }
         try {
           if (kind === "symptom") {
             const saved = await api<Symptom>("/api/health/symptoms", { method: "POST", body: JSON.stringify(value) });
@@ -322,7 +403,7 @@ export default function Home() {
 }
 
 function AuthPage({
-  mode, setMode, name, setName, email, setEmail, password, setPassword, error, busy, onSubmit,
+  mode, setMode, name, setName, email, setEmail, password, setPassword, error, busy, onSubmit, onDemo,
 }: {
   mode: "signup" | "login";
   setMode: (mode: "signup" | "login") => void;
@@ -335,6 +416,7 @@ function AuthPage({
   error: string;
   busy: boolean;
   onSubmit: (event: FormEvent) => void;
+  onDemo: () => void;
 }) {
   return <main className="min-h-screen bg-paper text-ink">
     <div className="mx-auto grid min-h-screen max-w-[1200px] lg:grid-cols-[1fr_0.9fr]">
@@ -368,11 +450,11 @@ function AuthPage({
             {mode === "signup" && <label className="block text-[11px] font-semibold text-[#5c6e63]">Full name
               <input autoComplete="name" required maxLength={120} value={name} onChange={(event) => setName(event.target.value)} placeholder="Your name" className="mt-1.5 w-full rounded-xl border border-[#e1e8e1] bg-white px-3.5 py-3 text-[12px] outline-none transition placeholder:text-[#a7b1a9] focus:border-[#83ad90]" />
             </label>}
-            <label className="block text-[11px] font-semibold text-[#5c6e63]">Email address
-              <input type="email" autoComplete="email" required maxLength={254} value={email} onChange={(event) => setEmail(event.target.value)} placeholder="you@example.com" className="mt-1.5 w-full rounded-xl border border-[#e1e8e1] bg-white px-3.5 py-3 text-[12px] outline-none transition placeholder:text-[#a7b1a9] focus:border-[#83ad90]" />
+            <label className="block text-[11px] font-semibold text-[#5c6e63]">{mode === "login" ? "Email or demo username" : "Email address"}
+              <input type={mode === "login" ? "text" : "email"} autoComplete={mode === "login" ? "username" : "email"} required maxLength={254} value={email} onChange={(event) => setEmail(event.target.value)} placeholder={mode === "login" ? "you@example.com or admin" : "you@example.com"} className="mt-1.5 w-full rounded-xl border border-[#e1e8e1] bg-white px-3.5 py-3 text-[12px] outline-none transition placeholder:text-[#a7b1a9] focus:border-[#83ad90]" />
             </label>
             <label className="block text-[11px] font-semibold text-[#5c6e63]">Password
-              <input type="password" autoComplete={mode === "signup" ? "new-password" : "current-password"} required minLength={8} maxLength={128} value={password} onChange={(event) => setPassword(event.target.value)} placeholder="At least 8 characters" className="mt-1.5 w-full rounded-xl border border-[#e1e8e1] bg-white px-3.5 py-3 text-[12px] outline-none transition placeholder:text-[#a7b1a9] focus:border-[#83ad90]" />
+              <input type="password" autoComplete={mode === "signup" ? "new-password" : "current-password"} required minLength={mode === "signup" ? 8 : undefined} maxLength={128} value={password} onChange={(event) => setPassword(event.target.value)} placeholder={mode === "signup" ? "At least 8 characters" : "Your password (demo: admin)"} className="mt-1.5 w-full rounded-xl border border-[#e1e8e1] bg-white px-3.5 py-3 text-[12px] outline-none transition placeholder:text-[#a7b1a9] focus:border-[#83ad90]" />
               {mode === "signup" && <span className="mt-1.5 block text-[9px] font-normal text-[#9ba69e]">Use at least 8 characters.</span>}
             </label>
             {error && <div role="alert" className="rounded-xl border border-[#f0d2ca] bg-[#fff5f1] px-3.5 py-3 text-[10px] leading-5 text-[#a54b3b]">{error}</div>}
@@ -382,6 +464,13 @@ function AuthPage({
               {!busy && <ArrowRight size={14} />}
             </button>
           </form>
+          <div className="mt-5 rounded-2xl border border-[#e8ede8] bg-[#f7f9f6] p-4">
+            <div className="text-[11px] font-bold text-ink">Just looking around?</div>
+            <p className="mt-1 text-[10px] leading-5 text-[#849188]">Enter the demo workspace without creating an account. Or choose Sign in and use username <strong>admin</strong> and password <strong>admin</strong>. Demo changes stay in this browser and are not saved to an account.</p>
+            <button type="button" onClick={onDemo} className="mt-3 flex w-full items-center justify-center gap-2 rounded-xl border border-[#cbd9cc] bg-white py-3 text-[11px] font-bold text-forest transition hover:bg-[#eef5ef]">
+              Continue as demo <ArrowRight size={14} />
+            </button>
+          </div>
           <div className="mt-5 text-center text-[11px] text-[#87948b]">
             {mode === "signup" ? "Already have an account?" : "New to CareCopilot?"}{" "}
             <button onClick={() => setMode(mode === "signup" ? "login" : "signup")} className="font-bold text-forest hover:underline">{mode === "signup" ? "Sign in" : "Create an account"}</button>
@@ -490,7 +579,7 @@ function Reports({ reports, busy, onUpload }: { reports: Report[]; busy: boolean
     event.target.value = "";
   }
   return <div><PageHeading eyebrow="Your documents" title="Medical reports, made clearer" description="Keep your documents together and explore a plain-language overview." action={<label className="flex cursor-pointer items-center gap-2 self-start rounded-xl bg-forest px-4 py-2.5 text-[10px] font-bold text-white hover:bg-[#184c3b] sm:self-auto"><Upload size={14} /> Upload report<input type="file" accept=".pdf,.jpg,.jpeg,.png" className="hidden" onChange={chooseFile} /></label>} />
-    <div className="mb-5 rounded-2xl border border-[#e8ede8] bg-[#f0f5ef] p-4 text-[10px] leading-5 text-[#64776b]"><div className="flex items-center gap-2 font-bold text-ink"><ShieldCheck size={15} className="text-forest" /> Your reports are personal</div><p className="mt-1">With an AI provider configured, uploaded images and extracted report text are sent to that provider to scan and explain. Without one, reports use a clearly labeled demo explanation and images are not scanned. AI can miss context; always review results with a qualified clinician.</p></div>
+    <div className="mb-5 rounded-2xl border border-[#e8ede8] bg-[#f0f5ef] p-4 text-[10px] leading-5 text-[#64776b]"><div className="flex items-center gap-2 font-bold text-ink"><ShieldCheck size={15} className="text-forest" /> Your reports are personal</div><p className="mt-1">AI report scanning sends uploaded documents and extracted text to the configured provider. Demo scans are not saved to an account. Without an AI key, AI report scanning is unavailable. AI can miss context; always review results with a qualified clinician.</p></div>
     {busy && <div className="mb-4 flex items-center gap-2 text-[10px] text-[#829087]"><LoaderCircle className="animate-spin" size={15} />Analyzing your report…</div>}
     <div className="grid gap-4 md:grid-cols-2">{reports.map((report) => <article key={report.id} className="rounded-[22px] border border-[#e8ede8] bg-white p-5 shadow-soft"><div className="flex items-start gap-3"><div className="rounded-xl bg-[#edf5ed] p-3 text-forest"><FileText size={19} /></div><div className="min-w-0 flex-1"><div className="break-words text-[12px] font-bold">{report.file_name}</div><div className="mt-1 text-[9px] text-[#96a29a]">{report.report_type} · {dateLabel(report.created_at)}</div></div><MoreHorizontal size={17} className="text-[#9aa79f]" /></div><div className="mt-4 border-t border-[#eff2ef] pt-4"><div className="text-[9px] font-bold uppercase tracking-[1.1px] text-forest">Plain-language overview</div><div className="mt-2 space-y-2 text-[11px] leading-6 text-[#52645a] [&_h1]:mt-4 [&_h1]:text-[14px] [&_h1]:font-bold [&_h1]:text-forest [&_h2]:mt-4 [&_h2]:text-[13px] [&_h2]:font-bold [&_h2]:text-forest [&_h3]:mt-4 [&_h3]:text-[12px] [&_h3]:font-bold [&_h3]:text-forest [&_p]:my-2 [&_strong]:font-semibold [&_strong]:text-ink [&_ul]:my-2 [&_ul]:list-disc [&_ul]:space-y-1 [&_ul]:pl-5 [&_ol]:my-2 [&_ol]:list-decimal [&_ol]:space-y-1 [&_ol]:pl-5 [&_li]:pl-1"><ReactMarkdown>{formatReportMarkdown(report.ai_summary)}</ReactMarkdown></div><div className="mt-3 flex items-start gap-2 rounded-xl bg-[#f7f8f6] p-3 text-[9px] leading-4 text-[#929e96]"><CircleHelp size={13} className="mt-0.5 shrink-0" />Consider discussing this report with your healthcare professional.</div></div></article>)}</div>
   </div>;
